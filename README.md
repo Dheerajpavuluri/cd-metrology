@@ -40,7 +40,7 @@ Requires Python 3.10+.
 
 ```bash
 pip install -e ".[test]"
-pytest -q                                             # 19 tests
+pytest -q                                             # 27 tests
 
 cdmetro synth --out data/lot1                         # 4 wafers x 9 sites = 36 images
 cdmetro measure data/lot1 --workers 4                 # -> results/cd.sqlite, results/cd.csv
@@ -49,7 +49,9 @@ cdmetro serve                                         # REST API on :8000
 ```
 
 To measure your own images, put them in a folder and either give each one a
-`<name>.json` sidecar with `{"pixel_nm": ...}` or pass `--pixel-nm`.
+`<name>.json` sidecar with `{"pixel_nm": ...}` or pass `--pixel-nm`. PNG,
+TIFF, JPEG and BMP are read; 8- and 16-bit images keep their scale, and
+32-bit float or signed images are min-max scaled.
 
 ## How a measurement works
 
@@ -72,6 +74,18 @@ To measure your own images, put them in a folder and either give each one a
 5. **Height and sidewall angle.** The line top comes from a vertical profile
    through its centre; the sidewall angle from a straight-line fit of both
    walls over 20–80% of the height.
+
+Problem images get a status and a reason instead of a wrong number:
+
+| Situation | Result |
+|---|---|
+| contrast-to-noise below 5 | image `rejected` |
+| image tilted by more than 0.5° | image `failed`, with the measured angle |
+| line cut by the image border | line skipped, image `partial` |
+| region over 1.6× the median line width (bridged lines) | line skipped, image `partial` |
+| edges not found (e.g. a 2 nm gap) | line skipped, image `partial` |
+| dark lines on a bright fill | detected and measured normally |
+| unreadable file or unknown pixel size | image `failed`; the rest of the batch continues |
 
 `cdmetro/pipeline.py` runs this over a folder (optionally in parallel),
 scores every line's mid-height CD with a robust z-score (median and MAD, so
@@ -144,7 +158,7 @@ cdmetro/
   report.py     charts (matplotlib) and HTML report
   api.py        FastAPI service
   cli.py        cdmetro synth | measure | report | serve
-tests/          19 tests: accuracy on clean and noisy images, rejection, outliers, DB, report, API
+tests/          27 tests: accuracy, image problems, outliers, DB, report, API
 ```
 
 ## Limitations
@@ -157,8 +171,15 @@ tests/          19 tests: accuracy on clean and noisy images, rejection, outlier
   absolute CD.
 - Pixel size comes from metadata; there is no scale-bar reading or
   calibration against a reference standard.
-- Assumes lines are roughly vertical in the image. Tilted images would need
-  rotation correction first.
+- Tilted images are detected but not corrected; they need to be rotated level
+  first.
+- Short lines lose accuracy because the bottom and top cuts sit close to the
+  substrate and the rounded top. In single test images the worst line was off
+  by 0.22 nm at 20 nm tall and 0.47 nm at 10 nm, against 0.19 nm at 60 nm.
+- Assumes fill material above the lines (used to tell bright lines from dark
+  ones) and a single row of lines on one substrate.
+- Native microscope formats (.dm3/.dm4, .emd, .mrc) are not read; export to
+  TIFF first.
 
 ## License
 

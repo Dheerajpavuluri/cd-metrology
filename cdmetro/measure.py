@@ -8,17 +8,21 @@ Steps for one image:
    that cut through the lines are not, so the row-wise standard deviation
    drops sharply at the interface.
 3. Segment the lines above the interface (Otsu threshold + morphological
-   opening + connected components) to get one region per line, then refine
-   the SNR from the line and background intensity levels. The sub-pixel
-   interface comes from the vertical intensity profile in the gaps.
-4. For each line and each height, average a few rows into one horizontal
-   profile, smooth it, and locate the left and right edges at the 50% level
-   between the local background and line intensities, with linear
-   interpolation for sub-pixel positions. CD = right edge - left edge.
+   opening + connected components) to get one region per line, inverting
+   first if the lines are darker than the fill. Refine the SNR from the line
+   and background levels. The sub-pixel interface comes from the vertical
+   intensity profile in the gaps; comparing it gap by gap gives the tilt.
+4. Skip regions that touch the image border or are much wider than the
+   others (bridged lines). For each remaining line and each height, average
+   a few rows into one horizontal profile, smooth it, and locate the left
+   and right edges at the 50% level between the local background and line
+   intensities, with linear interpolation for sub-pixel positions.
+   CD = right edge - left edge.
 5. Fit the edge positions over 20-80% of the height to get the sidewall angle.
 
 `measure_image` never raises on a bad image; it returns a result whose status
-is "rejected" (quality gate) or "failed"/"partial" (edges not found).
+is "rejected" (quality gate), "failed" (nothing measurable, e.g. tilted) or
+"partial" (some lines skipped, with the reason).
 """
 
 from __future__ import annotations
@@ -32,6 +36,8 @@ import numpy as np
 
 HEIGHTS = {"bottom": 0.1, "mid": 0.5, "top": 0.9}
 MIN_SNR = 5.0
+MAX_TILT_DEG = 0.5      # beyond this the per-row cuts are no longer horizontal enough
+BRIDGE_RATIO = 1.6      # a region this much wider than the median line is treated as merged lines
 
 
 @dataclass
@@ -68,13 +74,25 @@ class MeasurementError(RuntimeError):
 
 
 def to_float(img: np.ndarray) -> np.ndarray:
-    """8- or 16-bit image (grayscale or BGR) -> float32 grayscale in [0, 1]."""
+    """Grayscale or BGR image -> float32 grayscale in [0, 1].
+
+    8- and 16-bit images keep their absolute scale; float and signed-integer
+    images (common for raw microscope data) are min-max scaled, which is fine
+    because every threshold here is relative to levels measured in the image.
+    """
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if img.dtype == np.uint8:
         return img.astype(np.float32) / 255.0
     if img.dtype == np.uint16:
         return img.astype(np.float32) / 65535.0
+    if img.dtype.kind in "fi":
+        img = img.astype(np.float32)
+        lo, hi = float(np.nanmin(img)), float(np.nanmax(img))
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            raise MeasurementError("image contains no finite pixels")
+        img = np.nan_to_num(img, nan=lo)
+        return (img - lo) / (hi - lo) if hi > lo else np.zeros_like(img)
     raise MeasurementError(f"unsupported pixel type {img.dtype}")
 
 
@@ -118,12 +136,25 @@ def find_interface(img: np.ndarray) -> int:
     return int(rows.max()) + 1
 
 
-def segment_lines(img: np.ndarray, interface: int, min_area_px: int = 200):
-    """Bounding boxes (x, y, w, h) of the lines above the interface, left to right, and the mask."""
+def _bright_mask(img: np.ndarray, interface: int) -> np.ndarray:
+    """Otsu mask of the bright phase above the interface."""
     region = cv2.GaussianBlur(img[: max(interface - 3, 1)], (0, 0), 1.0)
     u8 = np.clip(region * 255, 0, 255).astype(np.uint8)
     _, mask = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return mask
+
+
+def lines_are_dark(img: np.ndarray, interface: int) -> bool:
+    """True when the fill is the bright phase, i.e. dark lines on a bright background.
+
+    Assumes the top rows of the image are fill material above the lines.
+    """
+    return bool((_bright_mask(img, interface)[:3] > 0).mean() > 0.5)
+
+
+def segment_lines(img: np.ndarray, interface: int, min_area_px: int = 200):
+    """Bounding boxes (x, y, w, h) of the lines above the interface, left to right, and the mask."""
+    mask = cv2.morphologyEx(_bright_mask(img, interface), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     n, _, cc, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     boxes = [tuple(cc[i, :4]) for i in range(1, n) if cc[i, cv2.CC_STAT_AREA] >= min_area_px]
     return sorted(boxes, key=lambda b: b[0]), mask
@@ -160,6 +191,8 @@ def measure_image(img: np.ndarray, pixel_nm: float, name: str = "image",
         return reject(rough_contrast, "contrast too low to measure")
     try:
         interface = find_interface(img)
+        if lines_are_dark(img, interface):
+            img = 1.0 - img            # measure as bright lines; edge positions are unchanged
         boxes, mask = segment_lines(img, interface)
     except MeasurementError as e:
         return reject(rough_contrast, str(e))
@@ -187,16 +220,41 @@ def measure_image(img: np.ndarray, pixel_nm: float, name: str = "image",
 
     if len(gap_cols) < 3:
         return fail("no gap between lines to locate the interface")
-    vprof = _smooth1d(img[:, gap_cols].mean(axis=1))
     sub_level = float(np.median(img[min(interface + 5, h - 1):, gap_cols]))
+    level = (bg_level + sub_level) / 2
+    rising = sub_level > bg_level
+
+    # tilt: the interface should sit on the same row in every gap
+    xs, ys = [], []
+    for group in np.split(gap_cols, np.nonzero(np.diff(gap_cols) > 1)[0] + 1):
+        if len(group) >= 3:
+            try:
+                ys.append(_crossing(_smooth1d(img[:, group].mean(axis=1)), level, interface,
+                                    rising=rising, reach=h))
+                xs.append(float(group.mean()))
+            except MeasurementError:
+                pass
+    if len(xs) >= 2:
+        tilt = float(np.degrees(np.arctan(np.polyfit(xs, ys, 1)[0])))
+        if abs(tilt) > MAX_TILT_DEG:
+            return fail(f"image tilted by {tilt:+.1f} degrees; rotate it level first")
+
+    vprof = _smooth1d(img[:, gap_cols].mean(axis=1))
     try:
-        interface_y = _crossing(vprof, (bg_level + sub_level) / 2, interface,
-                                rising=sub_level > bg_level, reach=8)
+        interface_y = _crossing(vprof, level, interface, rising=rising, reach=8)
     except MeasurementError:
         return fail("substrate interface not found")
 
     lines, skipped = [], []
+    median_w = float(np.median([b[2] for b in boxes]))
     for idx, box in enumerate(boxes):
+        x, _, bw, _ = box
+        if x == 0 or x + bw >= w:
+            skipped.append(f"line {idx}: touches the image border")
+            continue
+        if len(boxes) >= 3 and bw > BRIDGE_RATIO * median_w:
+            skipped.append(f"line {idx}: {bw / median_w:.1f}x the median width, likely bridged lines")
+            continue
         try:
             lines.append(_measure_line(img, idx, box, interface_y, bg_level,
                                        line_level, pixel_nm, band))

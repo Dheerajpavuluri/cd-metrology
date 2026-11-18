@@ -2,6 +2,7 @@ import csv
 import json
 
 import cv2
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -84,3 +85,22 @@ def test_api(lot, monkeypatch):
     assert r.status_code == 200 and r.json()["status"] in ("rejected", "failed")
     assert client.post("/measure", params={"pixel_nm": 0.5},
                        files={"file": ("x.png", b"not an image", "image/png")}).status_code == 400
+
+
+def test_duplicate_image_names_rejected(tmp_path):
+    for ext in (".png", ".tif"):
+        cv2.imwrite(str(tmp_path / f"a{ext}"), np.zeros((8, 8), np.uint8))
+    with pytest.raises(ValueError, match="unique"):
+        run(tmp_path, tmp_path / "x.sqlite")
+
+
+def test_report_unknown_run(lot, tmp_path):
+    root, _ = lot
+    with pytest.raises(ValueError, match="not found"):
+        build(root / "cd.sqlite", tmp_path, run_id=99)
+
+
+def test_api_without_database(tmp_path, monkeypatch):
+    monkeypatch.setenv("CDMETRO_DB", str(tmp_path / "missing.sqlite"))
+    from cdmetro.api import app
+    assert TestClient(app).get("/runs").status_code == 503

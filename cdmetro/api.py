@@ -27,7 +27,10 @@ app = FastAPI(title="cd-metrology", version="0.1.0")
 
 def get_conn() -> Iterator[sqlite3.Connection]:
     """One connection per request, closed afterwards."""
-    conn = db.connect(os.environ.get("CDMETRO_DB", "results/cd.sqlite"))
+    path = os.environ.get("CDMETRO_DB", "results/cd.sqlite")
+    if not os.path.exists(path):
+        raise HTTPException(503, f"no results database at {path}; run `cdmetro measure` first")
+    conn = db.connect(path)
     try:
         yield conn
     finally:

@@ -1,7 +1,8 @@
+import cv2
 import numpy as np
 import pytest
 
-from cdmetro.measure import HEIGHTS, estimate_noise, measure_file, measure_image
+from cdmetro.measure import HEIGHTS, estimate_noise, measure_file, measure_image, to_float
 from cdmetro.synth import Recipe, render
 
 
@@ -86,3 +87,48 @@ def test_bad_files_fail_without_raising(tmp_path):
 
     res, _ = measure_file(corrupt)            # no sidecar and no pixel size given
     assert res.status == "failed" and "pixel size" in res.reason
+
+
+def test_dark_lines_on_bright_background():
+    r = Recipe(line_level=0.2, bg_level=0.75)
+    img, truth = render(r, np.random.default_rng(6))
+    res = measure_image(img, r.pixel_nm)
+    assert res.status == "ok" and len(res.lines) == r.n_lines
+    for ln, t in zip(res.lines, truth):
+        assert ln.cd_nm["mid"] == pytest.approx(t.cd_nm["mid"], abs=0.3)
+
+
+def test_line_cut_by_image_border_is_skipped():
+    img, truth, r = _clean()
+    res = measure_image(img[:, 64:], r.pixel_nm)        # cuts through the first line
+    assert res.status == "partial"
+    assert "touches the image border" in res.reason
+    assert len(res.lines) == r.n_lines - 1
+    for ln, t in zip(res.lines, truth[1:]):
+        assert ln.cd_nm["mid"] == pytest.approx(t.cd_nm["mid"], abs=0.05)
+
+
+def test_bridged_lines_are_reported():
+    img, truth, r = _clean()
+    img[120:140, 170:250] = r.line_level                 # join lines 1 and 2
+    res = measure_image(img, r.pixel_nm)
+    assert res.status == "partial"
+    assert "likely bridged lines" in res.reason
+    assert len(res.lines) == r.n_lines - 2
+
+
+def test_float_images_are_scaled():
+    img, truth, r = _clean()
+    raw = (img * 3000.0 - 500.0).astype(np.float32)      # arbitrary detector units
+    res = measure_image(to_float(raw), r.pixel_nm)
+    assert res.status == "ok"
+    assert res.lines[0].cd_nm["mid"] == pytest.approx(truth[0].cd_nm["mid"], abs=0.05)
+
+
+def test_tilted_image_is_reported():
+    img, _, r = _clean()
+    rot = cv2.getRotationMatrix2D((img.shape[1] / 2, img.shape[0] / 2), 2.0, 1.0)
+    tilted = cv2.warpAffine(img, rot, img.shape[::-1], borderMode=cv2.BORDER_REFLECT)
+    res = measure_image(tilted, r.pixel_nm)
+    assert res.status == "failed"
+    assert "tilted" in res.reason

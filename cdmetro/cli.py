@@ -48,7 +48,7 @@ def main(argv=None) -> int:
         t0 = time.perf_counter()
         try:
             summary = run(a.folder, a.db, a.csv, a.pixel_nm, a.workers)
-        except FileNotFoundError as e:
+        except (FileNotFoundError, ValueError) as e:
             p.error(str(e))
         summary["seconds"] = round(time.perf_counter() - t0, 2)
         print(json.dumps(summary, indent=2))

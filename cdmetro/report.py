@@ -60,7 +60,10 @@ def build(db_path: Path, out_dir: Path, image_dir: Path | None = None,
     run_id = run_id or db.latest_run(conn)
     if run_id is None:
         raise ValueError("database has no runs")
-    run = db.rows(conn, "SELECT * FROM runs WHERE id = ?", (run_id,))[0]
+    found = db.rows(conn, "SELECT * FROM runs WHERE id = ?", (run_id,))
+    if not found:
+        raise ValueError(f"run {run_id} not found")
+    run = found[0]
     images = db.rows(conn, "SELECT * FROM image_summary WHERE run_id = ? ORDER BY wafer, site, name", (run_id,))
     lines = db.rows(conn, """SELECT l.*, i.name, i.wafer, i.site FROM lines l JOIN images i ON i.id = l.image_id
                               WHERE i.run_id = ? ORDER BY i.wafer, i.site, l.idx""", (run_id,))

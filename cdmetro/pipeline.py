@@ -27,6 +27,10 @@ def run(folder: Path, db_path: Path, csv_path: Path | None = None,
     images = find_images(folder)
     if not images:
         raise FileNotFoundError(f"no images in {folder}")
+    stems = [p.stem for p in images]
+    dupes = sorted({s for s in stems if stems.count(s) > 1})
+    if dupes:
+        raise ValueError(f"image names must be unique without the extension: {', '.join(dupes)}")
     jobs = [(p, pixel_nm) for p in images]
     if workers > 1:
         with ProcessPoolExecutor(max_workers=workers) as pool:
